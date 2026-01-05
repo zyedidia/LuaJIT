@@ -524,6 +524,18 @@ typedef struct GCtab {
 
 /* -- State objects ------------------------------------------------------- */
 
+/* -- JavaScript exception handler for LunaJS ----------------------------- */
+
+#define LJ_JSEXC_FIXED 32  /* Fixed array size for exception handlers. */
+
+/* JavaScript exception handler node. */
+typedef struct JSExcHandlerNode {
+  ptrdiff_t base_ofs;        /* Offset from L->stack (survives realloc). */
+  const BCIns *catch_pc;     /* PC to jump to on catch. */
+  BCReg catch_reg;           /* Register to store exception value. */
+  struct JSExcHandlerNode *prev;  /* Previous handler (for overflow list). */
+} JSExcHandlerNode;
+
 /* VM states. */
 enum {
   LJ_VMST_INTERP,	/* Interpreter. */
@@ -702,6 +714,14 @@ struct lua_State {
   GCRef env;		/* Thread environment (table of globals). */
   void *cframe;		/* End of C stack frame chain. */
   MSize stacksize;	/* True stack size (incl. LJ_STACK_EXTRA). */
+  /* JavaScript exception handling for LunaJS. */
+  JSExcHandlerNode js_exc_stack[LJ_JSEXC_FIXED];  /* Fixed handler array. */
+  uint8_t js_exc_depth;	/* Count in fixed array (0-32). */
+  JSExcHandlerNode *js_exc_overflow;  /* Overflow list for deep nesting. */
+  /* JavaScript exception unwinding state. */
+  TValue js_pending_exc;	/* Pending exception during longjmp unwind. */
+  JSExcHandlerNode *js_pending_handler;  /* Handler to resume to after longjmp. */
+  uint8_t js_in_unwind;	/* Flag: currently unwinding JS exception. */
 };
 
 #define G(L)			(mref(L->glref, global_State))

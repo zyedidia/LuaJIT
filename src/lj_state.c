@@ -367,6 +367,9 @@ lua_State *lj_state_new(lua_State *L)
   setgcrefnull(L1->openupval);
   setmrefr(L1->glref, L->glref);
   setgcrefr(L1->env, L->env);
+  /* Initialize JavaScript exception handling for LunaJS. */
+  L1->js_exc_depth = 0;
+  L1->js_exc_overflow = NULL;
   stack_init(L1, L);  /* init stack */
   lj_assertL(iswhite(obj2gco(L1)), "new thread object is not white");
   return L1;

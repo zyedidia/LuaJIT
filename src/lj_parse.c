@@ -1184,8 +1184,11 @@ static void gola_patch(LexState *ls, VarInfo *vg, VarInfo *vl)
 {
   FuncState *fs = ls->fs;
   BCPos pc = vg->startpc;
+  BCIns *ip = &fs->bcbase[pc].ins;
   setgcrefnull(vg->name);  /* Invalidate pending goto. */
-  setbc_a(&fs->bcbase[pc].ins, vl->slot);
+  /* Don't overwrite A for JSCATCH - it contains the destination register. */
+  if (bc_op(*ip) != BC_JSCATCH)
+    setbc_a(ip, vl->slot);
   jmp_patch(fs, pc, vl->startpc);
 }
 
@@ -2397,6 +2400,69 @@ static void parse_label(LexState *ls)
   gola_resolve(ls, fs->bl, idx);
 }
 
+/* -- JavaScript exception handling statements ----------------------------- */
+
+/* Parse 'jsthrow' statement: jsthrow expr */
+static void parse_jsthrow(LexState *ls)
+{
+  FuncState *fs = ls->fs;
+  ExpDesc e;
+  lj_lex_next(ls);  /* Skip 'jsthrow'. */
+  expr(ls, &e);
+  bcemit_AD(fs, BC_JSTHROW, expr_toanyreg(fs, &e), 0);
+}
+
+/* Parse 'jsuncatch' statement: jsuncatch */
+static void parse_jsuncatch(LexState *ls)
+{
+  FuncState *fs = ls->fs;
+  lj_lex_next(ls);  /* Skip 'jsuncatch'. */
+  bcemit_AD(fs, BC_JSUNCATCH, 0, 0);
+}
+
+/* Parse 'jscatch' statement: jscatch localvar, labelname */
+static void parse_jscatch(LexState *ls)
+{
+  FuncState *fs = ls->fs;
+  BCReg reg;
+  GCstr *label;
+  VarInfo *vl;
+
+  lj_lex_next(ls);  /* Skip 'jscatch'. */
+
+  /* Parse destination variable (must be an existing local). */
+  if (ls->tok != TK_name)
+    lj_lex_error(ls, ls->tok, LJ_ERR_XSYMBOL);
+  {
+    GCstr *name = strV(&ls->tokval);
+    BCReg slot = var_lookup_local(fs, name);
+    lj_lex_next(ls);  /* Advance past the variable name. */
+    if ((int32_t)slot < 0)
+      lj_lex_error(ls, 0, LJ_ERR_XSYMBOL);  /* Must be a local variable. */
+    reg = slot;
+  }
+
+  lex_check(ls, ',');
+
+  /* Parse label name. */
+  if (ls->tok != TK_name)
+    lj_lex_error(ls, ls->tok, LJ_ERR_XSYMBOL);
+  label = lex_str(ls);
+
+  /* Check if label already exists (backward jump). */
+  vl = gola_findlabel(ls, label);
+  if (vl) {
+    /* Backward jump to existing label. */
+    BCPos target = vl->startpc;
+    int32_t delta = (int32_t)(target - fs->pc) - 1;
+    bcemit_AJ(fs, BC_JSCATCH, reg, delta);
+  } else {
+    /* Forward jump - emit instruction and track for later resolution. */
+    fs->bl->flags |= FSCOPE_GOLA;
+    gola_new(ls, label, VSTACK_GOTO, bcemit_AJ(fs, BC_JSCATCH, reg, NO_JMP));
+  }
+}
+
 /* -- Blocks, loops and conditional statements ---------------------------- */
 
 /* Parse a block. */
@@ -2676,6 +2742,15 @@ static int parse_stmt(LexState *ls)
       break;
     }
     /* fallthrough */
+  case TK_jscatch:
+    parse_jscatch(ls);
+    break;
+  case TK_jsuncatch:
+    parse_jsuncatch(ls);
+    break;
+  case TK_jsthrow:
+    parse_jsthrow(ls);
+    break;
   default:
     parse_call_assign(ls);
     break;
