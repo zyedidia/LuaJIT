@@ -12,8 +12,9 @@
 #include "lj_func.h"
 #include "lj_jsexc.h"
 
-/* Push a JavaScript exception handler. */
-const BCIns *lj_jsexc_catch(lua_State *L, BCReg catch_reg, const BCIns *catch_pc)
+/* Push a JavaScript exception handler.
+** Returns pointer to the jmp_buf for the VM to call setjmp on. */
+jmp_buf *lj_jsexc_push_handler(lua_State *L, BCReg catch_reg, const BCIns *catch_pc)
 {
   JSExcHandlerNode *h;
 
@@ -27,11 +28,42 @@ const BCIns *lj_jsexc_catch(lua_State *L, BCReg catch_reg, const BCIns *catch_pc
     L->js_exc_overflow = h;
   }
 
+  h->L = L;
   h->base_ofs = L->base - tvref(L->stack);
   h->catch_pc = catch_pc;
   h->catch_reg = catch_reg;
 
-  return catch_pc;
+  return &h->jmp;
+}
+
+/* Called after longjmp returns to the VM. Sets up catch state. */
+void lj_jsexc_catch_resume(lua_State *L)
+{
+  /* Find the current handler (it's still on top since we haven't popped it). */
+  JSExcHandlerNode *h;
+  if (L->js_exc_overflow != NULL) {
+    h = L->js_exc_overflow;
+  } else {
+    h = &L->js_exc_stack[L->js_exc_depth - 1];
+  }
+
+  TValue *stack_base = tvref(L->stack);
+  TValue *handler_base = stack_base + h->base_ofs;
+
+  /* Copy exception value to catch register. */
+  copyTV(L, handler_base + h->catch_reg, &L->js_exc_value);
+
+  /* Set up state for VM. */
+  L->base = handler_base;
+  L->js_catch_pc = h->catch_pc;
+
+  /* Pop the handler. */
+  if (L->js_exc_overflow == h) {
+    L->js_exc_overflow = h->prev;
+    lj_mem_free(G(L), h, sizeof(JSExcHandlerNode));
+  } else {
+    L->js_exc_depth--;
+  }
 }
 
 /* Pop the current JavaScript exception handler. */
@@ -48,15 +80,11 @@ void lj_jsexc_uncatch(lua_State *L)
   }
 }
 
-/* Throw a JavaScript exception. Returns new PC and sets *newbase, or NULL if no handler. */
-const BCIns *lj_jsexc_throw(lua_State *L, TValue *exc, TValue **newbase)
+/* Find a valid JS exception handler. Returns NULL if none found. */
+static JSExcHandlerNode *find_js_handler(lua_State *L)
 {
-  TValue exc_value;
   TValue *current_base = L->base;
   TValue *stack_base = tvref(L->stack);
-
-  /* Copy exception value in case it gets overwritten during unwind. */
-  copyTV(L, &exc_value, exc);
 
   /* First check overflow list. */
   while (L->js_exc_overflow != NULL) {
@@ -64,14 +92,7 @@ const BCIns *lj_jsexc_throw(lua_State *L, TValue *exc, TValue **newbase)
     TValue *handler_base = stack_base + h->base_ofs;
 
     if (handler_base <= current_base) {
-      /* Valid handler - unwind and jump. */
-      lj_func_closeuv(L, handler_base);
-      L->js_exc_overflow = h->prev;
-      *newbase = handler_base;
-      copyTV(L, handler_base + h->catch_reg, &exc_value);
-      const BCIns *catch_pc = h->catch_pc;
-      lj_mem_free(G(L), h, sizeof(JSExcHandlerNode));
-      return catch_pc;
+      return h;  /* Valid handler found */
     }
     /* Stale handler (frame already returned), remove it. */
     L->js_exc_overflow = h->prev;
@@ -80,22 +101,45 @@ const BCIns *lj_jsexc_throw(lua_State *L, TValue *exc, TValue **newbase)
 
   /* Then check fixed array. */
   while (L->js_exc_depth > 0) {
-    JSExcHandlerNode *h = &L->js_exc_stack[--L->js_exc_depth];
+    JSExcHandlerNode *h = &L->js_exc_stack[L->js_exc_depth - 1];
     TValue *handler_base = stack_base + h->base_ofs;
 
     if (handler_base <= current_base) {
-      /* Valid handler - unwind and jump. */
-      lj_func_closeuv(L, handler_base);
-      *newbase = handler_base;
-      copyTV(L, handler_base + h->catch_reg, &exc_value);
-      return h->catch_pc;
+      return h;  /* Valid handler found */
     }
-    /* Stale handler, already decremented depth. */
+    /* Stale handler, remove it. */
+    L->js_exc_depth--;
   }
 
-  /* No handler found - return NULL to indicate we should raise a Lua error. */
-  *newbase = NULL;
-  /* Copy exception to top for error handling. */
-  copyTV(L, L->top++, &exc_value);
-  return NULL;
+  return NULL;  /* No handler found */
+}
+
+/* Try to handle a JS exception via longjmp. Returns 1 if handled, 0 if not.
+** Called from lj_err_throw before doing normal Lua error handling. */
+int lj_jsexc_try_catch(lua_State *L)
+{
+  JSExcHandlerNode *h = find_js_handler(L);
+  if (!h) {
+    return 0;  /* No handler, let Lua handle it */
+  }
+
+  TValue *stack_base = tvref(L->stack);
+  TValue *handler_base = stack_base + h->base_ofs;
+
+  /* Close upvalues between current frame and handler. */
+  lj_func_closeuv(L, handler_base);
+
+  /* Copy exception value (it's at L->top - 1 per Lua convention). */
+  if (L->top > L->base) {
+    copyTV(L, &L->js_exc_value, L->top - 1);
+  } else {
+    setnilV(&L->js_exc_value);
+  }
+
+  /* Do NOT pop the handler here - lj_jsexc_catch_resume will do that.
+  ** Just longjmp back to the VM. */
+  longjmp(h->jmp, 1);
+
+  /* Should not reach here */
+  return 0;
 }

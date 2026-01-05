@@ -189,7 +189,6 @@
   /* JavaScript exception handling for LunaJS. */ \
   _(JSCATCH,	dst,	___,	jump,	___) \
   _(JSUNCATCH,	___,	___,	___,	___) \
-  _(JSTHROW,	var,	___,	___,	___) \
   \
   /* Function headers. I/J = interp/JIT, F/V/C = fixarg/vararg/C func. */ \
   _(FUNCF,	rbase,	___,	___,	___) \

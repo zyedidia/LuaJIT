@@ -4672,9 +4672,22 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov L:CARG1->base, BASE
     |  mov CARG2d, RAd			// catch_reg = RA
     |  mov CARG3, RB			// catch_pc
-    |  call extern lj_jsexc_catch	// (lua_State *L, BCReg catch_reg, BCIns *catch_pc)
+    |  call extern lj_jsexc_push_handler  // Returns jmp_buf pointer in rax
+    |  mov CARG1, rax			// jmp_buf pointer for setjmp
+    |  call extern _setjmp		// Call setjmp directly from VM
+    |  test eax, eax
+    |  jnz >1				// If non-zero, longjmp returned here
+    |  // Normal path - setjmp returned 0
     |  mov L:RB, SAVE_L
     |  mov BASE, L:RB->base
+    |  ins_next
+    |1:
+    |  // Exception caught via longjmp - set up catch state
+    |  mov L:CARG1, SAVE_L
+    |  call extern lj_jsexc_catch_resume  // Sets up L->base, L->js_catch_pc
+    |  mov L:RB, SAVE_L
+    |  mov BASE, L:RB->base
+    |  mov PC, L:RB->js_catch_pc
     |  ins_next
     break;
 
@@ -4682,30 +4695,6 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov L:CARG1, SAVE_L
     |  call extern lj_jsexc_uncatch	// (lua_State *L)
     |  ins_next
-    break;
-
-  case BC_JSTHROW:
-    |  ins_AD	// RA = exception value reg, RD = unused
-    |  mov L:RB, SAVE_L
-    |  mov L:RB->base, BASE
-    |  mov L:CARG1, L:RB		// L
-    |  lea CARG2, [BASE+RA*8]		// exc = &BASE[RA]
-    |  sub rsp, 16			// Allocate space for newbase pointer
-    |  lea CARG3, [rsp]			// &newbase
-    |  call extern lj_jsexc_throw	// (lua_State *L, TValue *exc, TValue **newbase)
-    |  mov RB, [rsp]			// newbase
-    |  add rsp, 16
-    |  test RC, RC			// Check if handler found (catch_pc != NULL)
-    |  jz >1				// No handler, raise Lua error
-    |  mov PC, RC			// PC = catch_pc (return value in rax/RC)
-    |  mov BASE, RB			// BASE = newbase
-    |  ins_next
-    |1:
-    |  // No JS handler found - raise Lua error
-    |  // Exception value is already on L->top from lj_jsexc_throw
-    |  mov L:CARG1, SAVE_L
-    |  mov CARG2d, LUA_ERRRUN
-    |  jmp extern lj_err_throw		// (lua_State *L, int errcode)
     break;
 
   /* -- Function headers -------------------------------------------------- */

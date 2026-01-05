@@ -526,10 +526,14 @@ typedef struct GCtab {
 
 /* -- JavaScript exception handler for LunaJS ----------------------------- */
 
+#include <setjmp.h>
+
 #define LJ_JSEXC_FIXED 32  /* Fixed array size for exception handlers. */
 
 /* JavaScript exception handler node. */
 typedef struct JSExcHandlerNode {
+  jmp_buf jmp;               /* setjmp buffer for longjmp unwinding. */
+  struct lua_State *L;       /* Lua state (needed after longjmp). */
   ptrdiff_t base_ofs;        /* Offset from L->stack (survives realloc). */
   const BCIns *catch_pc;     /* PC to jump to on catch. */
   BCReg catch_reg;           /* Register to store exception value. */
@@ -718,10 +722,8 @@ struct lua_State {
   JSExcHandlerNode js_exc_stack[LJ_JSEXC_FIXED];  /* Fixed handler array. */
   uint8_t js_exc_depth;	/* Count in fixed array (0-32). */
   JSExcHandlerNode *js_exc_overflow;  /* Overflow list for deep nesting. */
-  /* JavaScript exception unwinding state. */
-  TValue js_pending_exc;	/* Pending exception during longjmp unwind. */
-  JSExcHandlerNode *js_pending_handler;  /* Handler to resume to after longjmp. */
-  uint8_t js_in_unwind;	/* Flag: currently unwinding JS exception. */
+  TValue js_exc_value;  /* Pending exception value during longjmp. */
+  const BCIns *js_catch_pc;  /* Catch PC to resume at after longjmp. */
 };
 
 #define G(L)			(mref(L->glref, global_State))

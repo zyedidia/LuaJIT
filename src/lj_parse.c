@@ -2402,16 +2402,6 @@ static void parse_label(LexState *ls)
 
 /* -- JavaScript exception handling statements ----------------------------- */
 
-/* Parse 'jsthrow' statement: jsthrow expr */
-static void parse_jsthrow(LexState *ls)
-{
-  FuncState *fs = ls->fs;
-  ExpDesc e;
-  lj_lex_next(ls);  /* Skip 'jsthrow'. */
-  expr(ls, &e);
-  bcemit_AD(fs, BC_JSTHROW, expr_toanyreg(fs, &e), 0);
-}
-
 /* Parse 'jsuncatch' statement: jsuncatch */
 static void parse_jsuncatch(LexState *ls)
 {
@@ -2747,9 +2737,6 @@ static int parse_stmt(LexState *ls)
     break;
   case TK_jsuncatch:
     parse_jsuncatch(ls);
-    break;
-  case TK_jsthrow:
-    parse_jsthrow(ls);
     break;
   default:
     parse_call_assign(ls);
