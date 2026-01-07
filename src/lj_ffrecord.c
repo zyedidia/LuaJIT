@@ -1569,6 +1569,53 @@ static void LJ_FASTCALL recff_debug_getmetatable(jit_State *J, RecordFFData *rd)
   J->base[0] = mt ? mtref : TREF_NIL;
 }
 
+/* -- JavaScript library recording ---------------------------------------- */
+
+/* Registry keys for JS special values - must match lib_js.c */
+#define JS_NULL_KEY "__js_null"
+#define JS_UNDEFINED_KEY "__js_undefined"
+
+static void LJ_FASTCALL recff_js_toBoolean(jit_State *J, RecordFFData *rd)
+{
+  TRef tr = J->base[0];
+  TValue *tv = &rd->argv[0];
+
+  if (!tr) return;  /* Interpreter will throw for missing arg */
+
+  /* Check type and return constant boolean based on JS truthiness rules */
+  if (tvisnil(tv)) {
+    J->base[0] = TREF_FALSE;
+  } else if (tvisfalse(tv)) {
+    J->base[0] = TREF_FALSE;
+  } else if (tvistrue(tv)) {
+    J->base[0] = TREF_TRUE;
+  } else if (tvisnumber(tv)) {
+    lua_Number n = numberVnum(tv);
+    /* 0 and NaN are falsy */
+    J->base[0] = (n == 0 || n != n) ? TREF_FALSE : TREF_TRUE;
+  } else if (tvisstr(tv)) {
+    GCstr *s = strV(tv);
+    /* Empty string is falsy */
+    J->base[0] = (s->len == 0) ? TREF_FALSE : TREF_TRUE;
+  } else if (tvistab(tv)) {
+    GCtab *t = tabV(tv);
+    /* Check against null/undefined from registry */
+    lua_State *L = J->L;
+    GCtab *reg = tabV(registry(L));
+    cTValue *null_tv = lj_tab_getstr(reg, lj_str_newlit(L, JS_NULL_KEY));
+    cTValue *undef_tv = lj_tab_getstr(reg, lj_str_newlit(L, JS_UNDEFINED_KEY));
+    if ((null_tv && tvistab(null_tv) && tabV(null_tv) == t) ||
+        (undef_tv && tvistab(undef_tv) && tabV(undef_tv) == t)) {
+      J->base[0] = TREF_FALSE;
+    } else {
+      J->base[0] = TREF_TRUE;
+    }
+  } else {
+    /* Everything else is truthy */
+    J->base[0] = TREF_TRUE;
+  }
+}
+
 /* -- Record calls to fast functions -------------------------------------- */
 
 #include "lj_recdef.h"
