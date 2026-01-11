@@ -1569,6 +1569,877 @@ static void LJ_FASTCALL recff_debug_getmetatable(jit_State *J, RecordFFData *rd)
   J->base[0] = mt ? mtref : TREF_NIL;
 }
 
+/* -- JavaScript library fast functions ----------------------------------- */
+
+/* Registry key for JS null sentinel (undefined is just Lua nil) */
+#define JS_NULL_KEY "__js_null"
+
+static void LJ_FASTCALL recff_js_toBoolean(jit_State *J, RecordFFData *rd)
+{
+  TRef tr = J->base[0];
+  TValue *tv = &rd->argv[0];
+
+  if (!tr) return;  /* Interpreter will throw for missing arg */
+
+  /* Check type and return constant boolean based on JS truthiness rules */
+  if (tvisnil(tv)) {
+    J->base[0] = TREF_FALSE;  /* nil (undefined) is falsy */
+  } else if (tvisfalse(tv)) {
+    J->base[0] = TREF_FALSE;
+  } else if (tvistrue(tv)) {
+    J->base[0] = TREF_TRUE;
+  } else if (tvisnumber(tv)) {
+    lua_Number n = numberVnum(tv);
+    /* 0 and NaN are falsy */
+    J->base[0] = (n == 0 || n != n) ? TREF_FALSE : TREF_TRUE;
+  } else if (tvisstr(tv)) {
+    GCstr *s = strV(tv);
+    /* Empty string is falsy */
+    J->base[0] = (s->len == 0) ? TREF_FALSE : TREF_TRUE;
+  } else if (tvistab(tv)) {
+    GCtab *t = tabV(tv);
+    /* Check against null sentinel from registry */
+    lua_State *L = J->L;
+    GCtab *reg = tabV(registry(L));
+    cTValue *null_tv = lj_tab_getstr(reg, lj_str_newlit(L, JS_NULL_KEY));
+    if (null_tv && tvistab(null_tv) && tabV(null_tv) == t) {
+      J->base[0] = TREF_FALSE;  /* null is falsy */
+    } else {
+      J->base[0] = TREF_TRUE;  /* other tables are truthy */
+    }
+  } else {
+    /* Everything else is truthy */
+    J->base[0] = TREF_TRUE;
+  }
+}
+
+static void LJ_FASTCALL recff_js_inc(jit_State *J, RecordFFData *rd)
+{
+  TRef tr = J->base[0];
+  TValue *tv = &rd->argv[0];
+  if (!tr) return;
+
+  /* For numbers: emit n + 1.0 */
+  if (tref_isnumber(tr)) {
+    tr = lj_ir_tonum(J, tr);
+    J->base[0] = emitir(IRTN(IR_ADD), tr, lj_ir_knum_one(J));
+  } else if (tref_isstr(tr)) {
+    if (lj_strscan_number(strV(tv), tv)) {
+      J->base[0] = lj_ir_knum(J, numberVnum(tv) + 1.0);
+    } else {
+      J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* NaN */
+    }
+  } else if (tref_istrue(tr)) {
+    J->base[0] = lj_ir_knum(J, 2.0);  /* true -> 1, + 1 = 2 */
+  } else if (tref_isfalse(tr)) {
+    J->base[0] = lj_ir_knum_one(J);  /* false -> 0, + 1 = 1 */
+  } else if (tref_isnil(tr)) {
+    J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* undefined (nil) -> NaN */
+  } else if (tref_istab(tr)) {
+    GCtab *t = tabV(tv);
+    lua_State *L = J->L;
+    GCtab *reg = tabV(registry(L));
+    cTValue *null_tv = lj_tab_getstr(reg, lj_str_newlit(L, JS_NULL_KEY));
+    if (null_tv && tvistab(null_tv) && tabV(null_tv) == t) {
+      J->base[0] = lj_ir_knum_one(J);  /* null -> 0, + 1 = 1 */
+    } else {
+      J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* NaN */
+    }
+  } else {
+    J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* NaN */
+  }
+}
+
+static void LJ_FASTCALL recff_js_dec(jit_State *J, RecordFFData *rd)
+{
+  TRef tr = J->base[0];
+  TValue *tv = &rd->argv[0];
+  if (!tr) return;
+
+  if (tref_isnumber(tr)) {
+    tr = lj_ir_tonum(J, tr);
+    J->base[0] = emitir(IRTN(IR_SUB), tr, lj_ir_knum_one(J));
+  } else if (tref_isstr(tr)) {
+    if (lj_strscan_number(strV(tv), tv)) {
+      J->base[0] = lj_ir_knum(J, numberVnum(tv) - 1.0);
+    } else {
+      J->base[0] = lj_ir_knum(J, 0.0 / 0.0);
+    }
+  } else if (tref_istrue(tr)) {
+    J->base[0] = lj_ir_knum(J, 0.0);  /* true -> 1, - 1 = 0 */
+  } else if (tref_isfalse(tr)) {
+    J->base[0] = lj_ir_knum(J, -1.0);  /* false -> 0, - 1 = -1 */
+  } else if (tref_isnil(tr)) {
+    J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* undefined (nil) -> NaN */
+  } else if (tref_istab(tr)) {
+    GCtab *t = tabV(tv);
+    lua_State *L = J->L;
+    GCtab *reg = tabV(registry(L));
+    cTValue *null_tv = lj_tab_getstr(reg, lj_str_newlit(L, JS_NULL_KEY));
+    if (null_tv && tvistab(null_tv) && tabV(null_tv) == t) {
+      J->base[0] = lj_ir_knum(J, -1.0);  /* null -> 0, - 1 = -1 */
+    } else {
+      J->base[0] = lj_ir_knum(J, 0.0 / 0.0);
+    }
+  } else {
+    J->base[0] = lj_ir_knum(J, 0.0 / 0.0);
+  }
+}
+
+static void LJ_FASTCALL recff_js_lt(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  /* Fast path: both numbers */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    lua_Number na = numberVnum(tva);
+    lua_Number nb = numberVnum(tvb);
+    int result = (na < nb);
+    if (na != na || nb != nb) {
+      J->base[0] = TREF_FALSE;
+      return;
+    }
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    emitir(IRTG(result ? IR_LT : IR_GE, IRT_NUM), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  /* Fast path: both strings */
+  if (tref_isstr(tra) && tref_isstr(trb)) {
+    int32_t cmp = lj_str_cmp(strV(tva), strV(tvb));
+    int result = (cmp < 0);
+    TRef trcmp = lj_ir_call(J, IRCALL_lj_str_cmp, tra, trb);
+    TRef zero = lj_ir_kint(J, 0);
+    emitir(IRTGI(result ? IR_LT : IR_GE), trcmp, zero);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_gt(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    lua_Number na = numberVnum(tva);
+    lua_Number nb = numberVnum(tvb);
+    int result = (na > nb);
+    if (na != na || nb != nb) {
+      J->base[0] = TREF_FALSE;
+      return;
+    }
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    emitir(IRTG(result ? IR_GT : IR_LE, IRT_NUM), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_isstr(tra) && tref_isstr(trb)) {
+    int32_t cmp = lj_str_cmp(strV(tva), strV(tvb));
+    int result = (cmp > 0);
+    TRef trcmp = lj_ir_call(J, IRCALL_lj_str_cmp, tra, trb);
+    TRef zero = lj_ir_kint(J, 0);
+    emitir(IRTGI(result ? IR_GT : IR_LE), trcmp, zero);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_lte(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    lua_Number na = numberVnum(tva);
+    lua_Number nb = numberVnum(tvb);
+    if (na != na || nb != nb) {
+      J->base[0] = TREF_FALSE;
+      return;
+    }
+    int result = (na <= nb);
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    emitir(IRTG(result ? IR_LE : IR_GT, IRT_NUM), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_isstr(tra) && tref_isstr(trb)) {
+    int32_t cmp = lj_str_cmp(strV(tva), strV(tvb));
+    int result = (cmp <= 0);
+    TRef trcmp = lj_ir_call(J, IRCALL_lj_str_cmp, tra, trb);
+    TRef zero = lj_ir_kint(J, 0);
+    emitir(IRTGI(result ? IR_LE : IR_GT), trcmp, zero);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_gte(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    lua_Number na = numberVnum(tva);
+    lua_Number nb = numberVnum(tvb);
+    if (na != na || nb != nb) {
+      J->base[0] = TREF_FALSE;
+      return;
+    }
+    int result = (na >= nb);
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    emitir(IRTG(result ? IR_GE : IR_LT, IRT_NUM), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_isstr(tra) && tref_isstr(trb)) {
+    int32_t cmp = lj_str_cmp(strV(tva), strV(tvb));
+    int result = (cmp >= 0);
+    TRef trcmp = lj_ir_call(J, IRCALL_lj_str_cmp, tra, trb);
+    TRef zero = lj_ir_kint(J, 0);
+    emitir(IRTGI(result ? IR_GE : IR_LT), trcmp, zero);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_eq(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  /* Fast path: both numbers */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    lua_Number na = numberVnum(tva);
+    lua_Number nb = numberVnum(tvb);
+    if (na != na || nb != nb) {
+      J->base[0] = TREF_FALSE;
+      return;
+    }
+    int result = (na == nb);
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    emitir(IRTG(result ? IR_EQ : IR_NE, IRT_NUM), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  /* Fast path: both strings */
+  if (tref_isstr(tra) && tref_isstr(trb)) {
+    int result = lj_obj_equal(tva, tvb);
+    emitir(IRTG(result ? IR_EQ : IR_NE, IRT_STR), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  /* Fast path: both tables (reference equality) */
+  if (tref_istab(tra) && tref_istab(trb)) {
+    int result = lj_obj_equal(tva, tvb);
+    emitir(IRTG(result ? IR_EQ : IR_NE, IRT_TAB), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  /* Fast path: both booleans */
+  if ((tref_istrue(tra) || tref_isfalse(tra)) &&
+      (tref_istrue(trb) || tref_isfalse(trb))) {
+    int result = (tref_istrue(tra) == tref_istrue(trb));
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  /* Fast path: both nil (undefined == undefined) */
+  if (tref_isnil(tra) && tref_isnil(trb)) {
+    J->base[0] = TREF_TRUE;
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_neq(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    lua_Number na = numberVnum(tva);
+    lua_Number nb = numberVnum(tvb);
+    if (na != na || nb != nb) {
+      J->base[0] = TREF_TRUE;  /* NaN != NaN is true */
+      return;
+    }
+    int result = (na != nb);
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    emitir(IRTG(result ? IR_NE : IR_EQ, IRT_NUM), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_isstr(tra) && tref_isstr(trb)) {
+    int result = !lj_obj_equal(tva, tvb);
+    emitir(IRTG(result ? IR_NE : IR_EQ, IRT_STR), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_istab(tra) && tref_istab(trb)) {
+    int result = !lj_obj_equal(tva, tvb);
+    emitir(IRTG(result ? IR_NE : IR_EQ, IRT_TAB), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_isnil(tra) && tref_isnil(trb)) {
+    J->base[0] = TREF_FALSE;  /* undefined != undefined is false */
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_seq(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  /* Strict equality: different types => false (except int/num) */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    lua_Number na = numberVnum(tva);
+    lua_Number nb = numberVnum(tvb);
+    /* NaN !== NaN */
+    if (na != na || nb != nb) {
+      J->base[0] = TREF_FALSE;
+      return;
+    }
+    int result = (na == nb);
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    emitir(IRTG(result ? IR_EQ : IR_NE, IRT_NUM), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_isstr(tra) && tref_isstr(trb)) {
+    int result = lj_obj_equal(tva, tvb);
+    emitir(IRTG(result ? IR_EQ : IR_NE, IRT_STR), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_istab(tra) && tref_istab(trb)) {
+    int result = lj_obj_equal(tva, tvb);
+    emitir(IRTG(result ? IR_EQ : IR_NE, IRT_TAB), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_isnil(tra) && tref_isnil(trb)) {
+    J->base[0] = TREF_TRUE;  /* undefined === undefined */
+    return;
+  }
+
+  if (tref_isbool(tra) && tref_isbool(trb)) {
+    /* Same boolean type */
+    int result = (tref_istrue(tra) == tref_istrue(trb));
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  /* Different types => false for strict equality */
+  J->base[0] = TREF_FALSE;
+}
+
+static void LJ_FASTCALL recff_js_nseq(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  /* Strict inequality: different types => true (except int/num) */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    lua_Number na = numberVnum(tva);
+    lua_Number nb = numberVnum(tvb);
+    /* NaN !== NaN is true */
+    if (na != na || nb != nb) {
+      J->base[0] = TREF_TRUE;
+      return;
+    }
+    int result = (na != nb);
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    emitir(IRTG(result ? IR_NE : IR_EQ, IRT_NUM), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_isstr(tra) && tref_isstr(trb)) {
+    int result = !lj_obj_equal(tva, tvb);
+    emitir(IRTG(result ? IR_NE : IR_EQ, IRT_STR), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_istab(tra) && tref_istab(trb)) {
+    int result = !lj_obj_equal(tva, tvb);
+    emitir(IRTG(result ? IR_NE : IR_EQ, IRT_TAB), tra, trb);
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  if (tref_isnil(tra) && tref_isnil(trb)) {
+    J->base[0] = TREF_FALSE;  /* undefined !== undefined is false */
+    return;
+  }
+
+  if (tref_isbool(tra) && tref_isbool(trb)) {
+    int result = (tref_istrue(tra) != tref_istrue(trb));
+    J->base[0] = result ? TREF_TRUE : TREF_FALSE;
+    return;
+  }
+
+  /* Different types => true for strict inequality */
+  J->base[0] = TREF_TRUE;
+}
+
+static void LJ_FASTCALL recff_js_isNullish(jit_State *J, RecordFFData *rd)
+{
+  TRef tr = J->base[0];
+  TValue *tv = &rd->argv[0];
+
+  if (!tr) return;
+
+  if (tvisnil(tv)) {
+    J->base[0] = TREF_TRUE;  /* nil (undefined) is nullish */
+  } else if (tvistab(tv)) {
+    GCtab *t = tabV(tv);
+    lua_State *L = J->L;
+    GCtab *reg = tabV(registry(L));
+    cTValue *null_tv = lj_tab_getstr(reg, lj_str_newlit(L, JS_NULL_KEY));
+    if (null_tv && tvistab(null_tv) && tabV(null_tv) == t) {
+      J->base[0] = TREF_TRUE;  /* null is nullish */
+    } else {
+      J->base[0] = TREF_FALSE;  /* Regular table is not nullish */
+    }
+  } else {
+    J->base[0] = TREF_FALSE;
+  }
+}
+
+/* -- JavaScript arithmetic operators ------------------------------------- */
+
+static void LJ_FASTCALL recff_js_toNumber(jit_State *J, RecordFFData *rd)
+{
+  TRef tr = J->base[0];
+  TValue *tv = &rd->argv[0];
+
+  if (!tr) return;
+
+  if (tref_isnumber(tr)) {
+    J->base[0] = lj_ir_tonum(J, tr);
+  } else if (tref_isstr(tr)) {
+    if (lj_strscan_number(strV(tv), tv)) {
+      J->base[0] = lj_ir_knum(J, numberVnum(tv));
+    } else {
+      J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* NaN */
+    }
+  } else if (tref_istrue(tr)) {
+    J->base[0] = lj_ir_knum_one(J);
+  } else if (tref_isfalse(tr)) {
+    J->base[0] = lj_ir_knum(J, 0.0);
+  } else if (tref_isnil(tr)) {
+    J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* undefined -> NaN */
+  } else {
+    lj_trace_err(J, LJ_TRERR_NYICONV);
+  }
+}
+
+static void LJ_FASTCALL recff_js_add(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  /* Fast path: both numbers */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    J->base[0] = emitir(IRTN(IR_ADD), tra, trb);
+    return;
+  }
+
+  /* String concatenation or type coercion - fall back to interpreter */
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+  UNUSED(tva); UNUSED(tvb);
+}
+
+static void LJ_FASTCALL recff_js_sub(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+
+  if (!tra || !trb) return;
+
+  /* Fast path: both numbers */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    J->base[0] = emitir(IRTN(IR_SUB), tra, trb);
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_mul(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+
+  if (!tra || !trb) return;
+
+  /* Fast path: both numbers */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    J->base[0] = emitir(IRTN(IR_MUL), tra, trb);
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_div(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+
+  if (!tra || !trb) return;
+
+  /* Fast path: both numbers */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    J->base[0] = emitir(IRTN(IR_DIV), tra, trb);
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_mod(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  /* Fast path: both numbers */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    /* For integers, use IR_MOD directly.
+     * Note: JS fmod and Lua mod differ for negative numbers,
+     * but for the common case (non-negative dividend, positive divisor),
+     * they produce the same result. */
+    if (tref_isinteger(tra) && tref_isinteger(trb)) {
+      /* Guard against division by zero */
+      int32_t b = (tvisint(tvb) ? intV(tvb) : (int32_t)numV(tvb));
+      if (b != 0) {
+        emitir(IRTGI(IR_NE), trb, lj_ir_kint(J, 0));
+        J->base[0] = emitir(IRTI(IR_MOD), tra, trb);
+        return;
+      }
+    }
+    /* For floats: implement fmod as b - trunc(b/c)*c (JS/C semantics)
+     * Unlike Lua which uses floor, JS uses truncation toward zero. */
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    TRef tmp = emitir(IRTN(IR_DIV), tra, trb);
+    tmp = emitir(IRTN(IR_FPMATH), tmp, IRFPM_TRUNC);
+    tmp = emitir(IRTN(IR_MUL), tmp, trb);
+    J->base[0] = emitir(IRTN(IR_SUB), tra, tmp);
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_pow(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+
+  if (!tra || !trb) return;
+
+  /* Fast path: both numbers */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    tra = lj_ir_tonum(J, tra);
+    trb = lj_ir_tonum(J, trb);
+    J->base[0] = lj_ir_call(J, IRCALL_pow, tra, trb);
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_neg(jit_State *J, RecordFFData *rd)
+{
+  TRef tr = J->base[0];
+  TValue *tv = &rd->argv[0];
+
+  if (!tr) return;
+
+  /* Fast path: number */
+  if (tref_isnumber(tr)) {
+    tr = lj_ir_tonum(J, tr);
+    J->base[0] = emitir(IRTN(IR_NEG), tr, lj_ir_knum_zero(J));
+    return;
+  }
+
+  /* Handle constants */
+  if (tref_isstr(tr)) {
+    if (lj_strscan_number(strV(tv), tv)) {
+      J->base[0] = lj_ir_knum(J, -numberVnum(tv));
+    } else {
+      J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* NaN */
+    }
+    return;
+  }
+  if (tref_istrue(tr)) {
+    J->base[0] = lj_ir_knum(J, -1.0);
+    return;
+  }
+  if (tref_isfalse(tr)) {
+    J->base[0] = lj_ir_knum(J, -0.0);
+    return;
+  }
+  if (tref_isnil(tr)) {
+    J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* undefined -> NaN, -NaN = NaN */
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_pos(jit_State *J, RecordFFData *rd)
+{
+  TRef tr = J->base[0];
+  TValue *tv = &rd->argv[0];
+
+  if (!tr) return;
+
+  /* Fast path: already a number */
+  if (tref_isnumber(tr)) {
+    J->base[0] = lj_ir_tonum(J, tr);
+    return;
+  }
+
+  /* Handle constants */
+  if (tref_isstr(tr)) {
+    if (lj_strscan_number(strV(tv), tv)) {
+      J->base[0] = lj_ir_knum(J, numberVnum(tv));
+    } else {
+      J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* NaN */
+    }
+    return;
+  }
+  if (tref_istrue(tr)) {
+    J->base[0] = lj_ir_knum_one(J);
+    return;
+  }
+  if (tref_isfalse(tr)) {
+    J->base[0] = lj_ir_knum(J, 0.0);
+    return;
+  }
+  if (tref_isnil(tr)) {
+    J->base[0] = lj_ir_knum(J, 0.0 / 0.0);  /* undefined -> NaN */
+    return;
+  }
+
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_ushr(jit_State *J, RecordFFData *rd)
+{
+  TRef tra = J->base[0];
+  TRef trb = J->base[1];
+  TValue *tva = &rd->argv[0];
+  TValue *tvb = &rd->argv[1];
+
+  if (!tra || !trb) return;
+
+  /* Fast path: both numbers with non-negative result */
+  if (tref_isnumber(tra) && tref_isnumber(trb)) {
+    int32_t ia = (int32_t)numberVnum(tva);
+    int32_t ib = (int32_t)numberVnum(tvb);
+    uint32_t ua = (uint32_t)ia;
+    uint32_t shift = (uint32_t)ib & 31;
+    uint32_t result = ua >> shift;
+
+    /* If result fits in signed int (bit 31 = 0), we can emit IR directly */
+    if ((int32_t)result >= 0) {
+      tra = lj_opt_narrow_tobit(J, tra);
+      trb = lj_opt_narrow_tobit(J, trb);
+      if (!tref_isk(trb))
+        trb = emitir(IRTI(IR_BAND), trb, lj_ir_kint(J, 31));
+      J->base[0] = emitir(IRTI(IR_BSHR), tra, trb);
+      return;
+    }
+    /* Result needs unsigned interpretation (>= 2^31), return constant */
+    J->base[0] = lj_ir_knum(J, (lua_Number)result);
+    return;
+  }
+
+  /* Slow path: let interpreter handle type coercion */
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+/* -- JavaScript array operations ----------------------------------------- */
+
+static void LJ_FASTCALL recff_js_getElem(jit_State *J, RecordFFData *rd)
+{
+  TRef trtab = J->base[0];
+  TRef tridx = J->base[1];
+  TValue *tvtab = &rd->argv[0];
+  TValue *tvidx = &rd->argv[1];
+
+  if (!trtab || !tridx) return;
+
+  /* Fast path: table with numeric index (non-negative integer) */
+  if (tref_istab(trtab) && tref_isnumber(tridx)) {
+    lua_Number idx = numberVnum(tvidx);
+    /* Only handle non-negative integer indices for array access */
+    if (idx >= 0 && idx == (lua_Number)(int64_t)idx && idx < LJ_MAX_ASIZE) {
+      RecordIndex ix;
+      TRef key1;
+
+      /* Convert JS 0-based index to Lua 1-based: key = idx + 1 */
+      if (tref_isinteger(tridx)) {
+        key1 = emitir(IRTI(IR_ADD), tridx, lj_ir_kint(J, 1));
+      } else {
+        key1 = emitir(IRTN(IR_ADD), tridx, lj_ir_knum_one(J));
+      }
+
+      /* Set up RecordIndex for load (val = 0) */
+      memset(&ix, 0, sizeof(ix));
+      copyTV(J->L, &ix.tabv, tvtab);
+      setnumV(&ix.keyv, idx + 1);  /* Runtime key is also 1-based */
+      ix.tab = trtab;
+      ix.key = key1;
+      ix.val = 0;  /* 0 = load operation */
+      ix.idxchain = 0;  /* Raw lookup, no metamethods */
+
+      J->base[0] = lj_record_idx(J, &ix);
+      return;
+    }
+  }
+
+  /* Non-numeric or out-of-range index: let interpreter handle */
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
+static void LJ_FASTCALL recff_js_setElem(jit_State *J, RecordFFData *rd)
+{
+  TRef trtab = J->base[0];
+  TRef tridx = J->base[1];
+  TRef trval = J->base[2];
+  TValue *tvtab = &rd->argv[0];
+  TValue *tvidx = &rd->argv[1];
+  TValue *tvval = &rd->argv[2];
+
+  if (!trtab || !tridx || !trval) return;
+
+  /* Fast path: table with numeric index (non-negative integer) */
+  if (tref_istab(trtab) && tref_isnumber(tridx)) {
+    lua_Number idx = numberVnum(tvidx);
+    /* Only handle non-negative integer indices for array access */
+    if (idx >= 0 && idx == (lua_Number)(int64_t)idx && idx < LJ_MAX_ASIZE) {
+      RecordIndex ix;
+      TRef key1;
+
+      /* Convert JS 0-based index to Lua 1-based: key = idx + 1 */
+      if (tref_isinteger(tridx)) {
+        key1 = emitir(IRTI(IR_ADD), tridx, lj_ir_kint(J, 1));
+      } else {
+        key1 = emitir(IRTN(IR_ADD), tridx, lj_ir_knum_one(J));
+      }
+
+      /* Set up RecordIndex for store */
+      memset(&ix, 0, sizeof(ix));
+      copyTV(J->L, &ix.tabv, tvtab);
+      setnumV(&ix.keyv, idx + 1);  /* Runtime key is also 1-based */
+      copyTV(J->L, &ix.valv, tvval);
+      ix.tab = trtab;
+      ix.key = key1;
+      ix.val = trval;  /* Non-zero = store operation */
+      ix.idxchain = 0;  /* Raw lookup, no metamethods */
+
+      lj_record_idx(J, &ix);
+
+      /* Note: We skip recording the length update for JIT.
+       * The interpreter handles length updates correctly.
+       * For hot loops, array indices are typically within bounds. */
+      rd->nres = 0;  /* No return value */
+      return;
+    }
+  }
+
+  /* Non-numeric or out-of-range index: let interpreter handle */
+  lj_trace_err(J, LJ_TRERR_NYICONV);
+}
+
 /* -- Record calls to fast functions -------------------------------------- */
 
 #include "lj_recdef.h"
