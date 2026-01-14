@@ -19,8 +19,13 @@
 
 #include <math.h>
 
-/* Registry key for JS null (undefined is just Lua nil) */
+/* Registry keys for JS special values */
 #define JS_NULL_KEY "__js_null"
+#define JS_UNDEFINED_KEY "__js_undefined"
+
+/* Forward declarations for helper functions */
+static int is_null(lua_State *L, GCtab *t);
+static int is_undefined(lua_State *L, GCtab *t);
 
 /* -- JavaScript library functions ----------------------------------------- */
 
@@ -39,46 +44,44 @@
 **
 ** Returns true for everything else.
 */
-LJLIB_CF(js_toBoolean)		LJLIB_REC(.)
+/*
+** toBoolean - Convert JS value to boolean
+**
+** Fast path in assembly handles: nil, false, true, numbers (0/NaN check).
+** Fallback handles: strings (empty check), tables (null check).
+*/
+LJLIB_ASM(js_toBoolean)		LJLIB_REC(.)
 {
   TValue *o = lj_lib_checkany(L, 1);
   int result = 1;  /* Default: truthy */
 
-  /* Check for nil (= JS undefined) */
-  if (tvisnil(o)) {
-    result = 0;
-  }
-  /* Check for false */
-  else if (tvisfalse(o)) {
-    result = 0;
-  }
-  /* Check for number (0 and NaN are falsy) */
-  else if (tvisnumber(o)) {
-    lua_Number n = numberVnum(o);
-    /* 0 is falsy, NaN is falsy (NaN != NaN) */
-    if (n == 0 || n != n) {
-      result = 0;
-    }
-  }
   /* Check for empty string */
-  else if (tvisstr(o)) {
+  if (tvisstr(o)) {
     GCstr *s = strV(o);
     if (s->len == 0) {
       result = 0;
     }
   }
-  /* Check for null table (from registry) */
+  /* Check for null or undefined table (from registry) */
   else if (tvistab(o)) {
     GCtab *t = tabV(o);
-    lua_getfield(L, LUA_REGISTRYINDEX, JS_NULL_KEY);
-    if (lua_istable(L, -1) && tabV(L->top - 1) == t) {
+    if (is_null(L, t) || is_undefined(L, t)) {
       result = 0;
     }
-    lua_pop(L, 1);
+  }
+  /* Other types handled by assembly fast path, but fallback still works */
+  else if (tvisnil(o) || tvisfalse(o)) {
+    result = 0;
+  }
+  else if (tvisnumber(o)) {
+    lua_Number n = numberVnum(o);
+    if (n == 0 || n != n) {
+      result = 0;
+    }
   }
 
-  lua_pushboolean(L, result);
-  return 1;
+  setboolV(L->base-1-LJ_FR2, result);
+  return FFH_RES(1);
 }
 
 /* Helper: Check if a table is the null sentinel */
@@ -90,19 +93,27 @@ static int is_null(lua_State *L, GCtab *t)
   return result;
 }
 
+/* Helper: Check if a table is the undefined sentinel */
+static int is_undefined(lua_State *L, GCtab *t)
+{
+  lua_getfield(L, LUA_REGISTRYINDEX, JS_UNDEFINED_KEY);
+  int result = lua_istable(L, -1) && tabV(L->top - 1) == t;
+  lua_pop(L, 1);
+  return result;
+}
+
 /*
 ** inc - JavaScript increment (a + 1)
 **
-** Fast path for numbers, converts other types per JS ToNumber semantics.
+** Fast path in assembly handles number case.
+** This fallback handles type coercion.
 */
-LJLIB_CF(js_inc)		LJLIB_REC(.)
+LJLIB_ASM(js_inc)		LJLIB_REC(.)
 {
   TValue *o = lj_lib_checkany(L, 1);
   lua_Number n;
 
-  if (tvisnumber(o)) {
-    n = numberVnum(o) + 1.0;
-  } else if (tvisstr(o) && lj_strscan_number(strV(o), o)) {
+  if (tvisstr(o) && lj_strscan_number(strV(o), o)) {
     n = numberVnum(o) + 1.0;
   } else if (tvistrue(o)) {
     n = 2.0;  /* true -> 1, + 1 = 2 */
@@ -111,36 +122,32 @@ LJLIB_CF(js_inc)		LJLIB_REC(.)
   } else if (tvisnil(o)) {
     n = 0.0 / 0.0;  /* undefined (nil) -> NaN */
   } else if (tvistab(o)) {
-    /* Check for null (converts to 0) */
     GCtab *t = tabV(o);
     if (is_null(L, t)) {
       n = 1.0;  /* null -> 0, + 1 = 1 */
     } else {
-      /* other table -> NaN */
       n = 0.0 / 0.0;
     }
   } else {
-    /* Non-numeric value -> NaN */
     n = 0.0 / 0.0;
   }
 
-  lua_pushnumber(L, n);
-  return 1;
+  setnumV(L->base-1-LJ_FR2, n);
+  return FFH_RES(1);
 }
 
 /*
 ** dec - JavaScript decrement (a - 1)
 **
-** Fast path for numbers, converts other types per JS ToNumber semantics.
+** Fast path in assembly handles number case.
+** This fallback handles type coercion.
 */
-LJLIB_CF(js_dec)		LJLIB_REC(.)
+LJLIB_ASM(js_dec)		LJLIB_REC(.)
 {
   TValue *o = lj_lib_checkany(L, 1);
   lua_Number n;
 
-  if (tvisnumber(o)) {
-    n = numberVnum(o) - 1.0;
-  } else if (tvisstr(o) && lj_strscan_number(strV(o), o)) {
+  if (tvisstr(o) && lj_strscan_number(strV(o), o)) {
     n = numberVnum(o) - 1.0;
   } else if (tvistrue(o)) {
     n = 0.0;  /* true -> 1, - 1 = 0 */
@@ -159,8 +166,8 @@ LJLIB_CF(js_dec)		LJLIB_REC(.)
     n = 0.0 / 0.0;
   }
 
-  lua_pushnumber(L, n);
-  return 1;
+  setnumV(L->base-1-LJ_FR2, n);
+  return FFH_RES(1);
 }
 
 /* Helper: Convert value to number (JS ToNumber semantics) */
@@ -196,21 +203,17 @@ static lua_Number js_toNumber_impl(lua_State *L, TValue *o)
 
 /*
 ** lt - JavaScript less than (a < b)
+**
+** Fast path in assembly handles number+number case.
 */
-LJLIB_CF(js_lt)		LJLIB_REC(.)
+LJLIB_ASM(js_lt)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
   int result;
 
-  /* Fast path: both numbers */
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_Number na = numberVnum(a);
-    lua_Number nb = numberVnum(b);
-    result = na < nb;
-  }
   /* Fast path: both strings (lexicographic comparison) */
-  else if (tvisstr(a) && tvisstr(b)) {
+  if (tvisstr(a) && tvisstr(b)) {
     GCstr *sa = strV(a);
     GCstr *sb = strV(b);
     result = lj_str_cmp(sa, sb) < 0;
@@ -227,25 +230,22 @@ LJLIB_CF(js_lt)		LJLIB_REC(.)
     }
   }
 
-  lua_pushboolean(L, result);
-  return 1;
+  setboolV(L->base-1-LJ_FR2, result);
+  return FFH_RES(1);
 }
 
 /*
 ** gt - JavaScript greater than (a > b)
+**
+** Fast path in assembly handles number+number case.
 */
-LJLIB_CF(js_gt)		LJLIB_REC(.)
+LJLIB_ASM(js_gt)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
   int result;
 
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_Number na = numberVnum(a);
-    lua_Number nb = numberVnum(b);
-    result = na > nb;
-  }
-  else if (tvisstr(a) && tvisstr(b)) {
+  if (tvisstr(a) && tvisstr(b)) {
     GCstr *sa = strV(a);
     GCstr *sb = strV(b);
     result = lj_str_cmp(sa, sb) > 0;
@@ -260,25 +260,22 @@ LJLIB_CF(js_gt)		LJLIB_REC(.)
     }
   }
 
-  lua_pushboolean(L, result);
-  return 1;
+  setboolV(L->base-1-LJ_FR2, result);
+  return FFH_RES(1);
 }
 
 /*
 ** lte - JavaScript less than or equal (<=)
+**
+** Fast path in assembly handles number+number case.
 */
-LJLIB_CF(js_lte)		LJLIB_REC(.)
+LJLIB_ASM(js_lte)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
   int result;
 
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_Number na = numberVnum(a);
-    lua_Number nb = numberVnum(b);
-    result = na <= nb;
-  }
-  else if (tvisstr(a) && tvisstr(b)) {
+  if (tvisstr(a) && tvisstr(b)) {
     GCstr *sa = strV(a);
     GCstr *sb = strV(b);
     result = lj_str_cmp(sa, sb) <= 0;
@@ -293,25 +290,22 @@ LJLIB_CF(js_lte)		LJLIB_REC(.)
     }
   }
 
-  lua_pushboolean(L, result);
-  return 1;
+  setboolV(L->base-1-LJ_FR2, result);
+  return FFH_RES(1);
 }
 
 /*
 ** gte - JavaScript greater than or equal (>=)
+**
+** Fast path in assembly handles number+number case.
 */
-LJLIB_CF(js_gte)		LJLIB_REC(.)
+LJLIB_ASM(js_gte)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
   int result;
 
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_Number na = numberVnum(a);
-    lua_Number nb = numberVnum(b);
-    result = na >= nb;
-  }
-  else if (tvisstr(a) && tvisstr(b)) {
+  if (tvisstr(a) && tvisstr(b)) {
     GCstr *sa = strV(a);
     GCstr *sb = strV(b);
     result = lj_str_cmp(sa, sb) >= 0;
@@ -326,8 +320,8 @@ LJLIB_CF(js_gte)		LJLIB_REC(.)
     }
   }
 
-  lua_pushboolean(L, result);
-  return 1;
+  setboolV(L->base-1-LJ_FR2, result);
+  return FFH_RES(1);
 }
 
 /* -- Arithmetic operators ------------------------------------------------- */
@@ -386,17 +380,14 @@ LJLIB_CF(js_toNumber)		LJLIB_REC(.)
 **
 ** If either operand is a string, performs string concatenation.
 ** Otherwise converts both to numbers and adds.
+**
+** Fast path in assembly handles number+number case.
+** This fallback handles string concatenation and type coercion.
 */
-LJLIB_CF(js_add)		LJLIB_REC(.)
+LJLIB_ASM(js_add)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
-
-  /* Fast path: both numbers */
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_pushnumber(L, numberVnum(a) + numberVnum(b));
-    return 1;
-  }
 
   /* String concatenation if either is a string */
   if (tvisstr(a) || tvisstr(b)) {
@@ -404,78 +395,66 @@ LJLIB_CF(js_add)		LJLIB_REC(.)
     GCstr *sb = js_toString_impl(L, b);
     /* Concatenate strings */
     GCstr *result = lj_buf_cat2str(L, sa, sb);
-    setstrV(L, L->top++, result);
-    return 1;
+    setstrV(L, L->base-1-LJ_FR2, result);
+    return FFH_RES(1);
   }
 
-  /* Slow path: convert to numbers */
+  /* Convert to numbers and add */
   lua_Number na = js_toNumber_impl(L, a);
   lua_Number nb = js_toNumber_impl(L, b);
-  lua_pushnumber(L, na + nb);
-  return 1;
+  setnumV(L->base-1-LJ_FR2, na + nb);
+  return FFH_RES(1);
 }
 
 /*
 ** sub - JavaScript subtraction (a - b)
+**
+** Fast path in assembly handles number+number case.
 */
-LJLIB_CF(js_sub)		LJLIB_REC(.)
+LJLIB_ASM(js_sub)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
 
-  /* Fast path: both numbers */
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_pushnumber(L, numberVnum(a) - numberVnum(b));
-    return 1;
-  }
-
   /* Slow path: convert to numbers */
   lua_Number na = js_toNumber_impl(L, a);
   lua_Number nb = js_toNumber_impl(L, b);
-  lua_pushnumber(L, na - nb);
-  return 1;
+  setnumV(L->base-1-LJ_FR2, na - nb);
+  return FFH_RES(1);
 }
 
 /*
 ** mul - JavaScript multiplication (a * b)
+**
+** Fast path in assembly handles number+number case.
 */
-LJLIB_CF(js_mul)		LJLIB_REC(.)
+LJLIB_ASM(js_mul)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
 
-  /* Fast path: both numbers */
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_pushnumber(L, numberVnum(a) * numberVnum(b));
-    return 1;
-  }
-
   /* Slow path: convert to numbers */
   lua_Number na = js_toNumber_impl(L, a);
   lua_Number nb = js_toNumber_impl(L, b);
-  lua_pushnumber(L, na * nb);
-  return 1;
+  setnumV(L->base-1-LJ_FR2, na * nb);
+  return FFH_RES(1);
 }
 
 /*
 ** div - JavaScript division (a / b)
+**
+** Fast path in assembly handles number+number case.
 */
-LJLIB_CF(js_div)		LJLIB_REC(.)
+LJLIB_ASM(js_div)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
 
-  /* Fast path: both numbers */
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_pushnumber(L, numberVnum(a) / numberVnum(b));
-    return 1;
-  }
-
   /* Slow path: convert to numbers */
   lua_Number na = js_toNumber_impl(L, a);
   lua_Number nb = js_toNumber_impl(L, b);
-  lua_pushnumber(L, na / nb);
-  return 1;
+  setnumV(L->base-1-LJ_FR2, na / nb);
+  return FFH_RES(1);
 }
 
 /*
@@ -483,83 +462,66 @@ LJLIB_CF(js_div)		LJLIB_REC(.)
 **
 ** Uses fmod semantics where result has same sign as dividend (like C).
 ** This differs from Lua's % which has same sign as divisor.
+**
+** Fast path in assembly handles number+number case.
 */
-LJLIB_CF(js_mod)		LJLIB_REC(.)
+LJLIB_ASM(js_mod)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
 
-  /* Fast path: both numbers */
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_pushnumber(L, fmod(numberVnum(a), numberVnum(b)));
-    return 1;
-  }
-
   /* Slow path: convert to numbers */
   lua_Number na = js_toNumber_impl(L, a);
   lua_Number nb = js_toNumber_impl(L, b);
-  lua_pushnumber(L, fmod(na, nb));
-  return 1;
+  setnumV(L->base-1-LJ_FR2, fmod(na, nb));
+  return FFH_RES(1);
 }
 
 /*
 ** pow - JavaScript exponentiation (a ** b)
+**
+** Fast path in assembly handles number+number case.
 */
-LJLIB_CF(js_pow)		LJLIB_REC(.)
+LJLIB_ASM(js_pow)		LJLIB_REC(.)
 {
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
 
-  /* Fast path: both numbers */
-  if (tvisnumber(a) && tvisnumber(b)) {
-    lua_pushnumber(L, pow(numberVnum(a), numberVnum(b)));
-    return 1;
-  }
-
   /* Slow path: convert to numbers */
   lua_Number na = js_toNumber_impl(L, a);
   lua_Number nb = js_toNumber_impl(L, b);
-  lua_pushnumber(L, pow(na, nb));
-  return 1;
+  setnumV(L->base-1-LJ_FR2, pow(na, nb));
+  return FFH_RES(1);
 }
 
 /*
 ** neg - JavaScript unary negation (-a)
+**
+** Fast path in assembly handles number case.
 */
-LJLIB_CF(js_neg)		LJLIB_REC(.)
+LJLIB_ASM(js_neg)		LJLIB_REC(.)
 {
   TValue *o = lj_lib_checkany(L, 1);
 
-  /* Fast path: number */
-  if (tvisnumber(o)) {
-    lua_pushnumber(L, -numberVnum(o));
-    return 1;
-  }
-
   /* Slow path: convert to number */
   lua_Number n = js_toNumber_impl(L, o);
-  lua_pushnumber(L, -n);
-  return 1;
+  setnumV(L->base-1-LJ_FR2, -n);
+  return FFH_RES(1);
 }
 
 /*
 ** pos - JavaScript unary plus (+a)
 **
 ** Simply converts the value to a number (ToNumber).
+** Fast path in assembly handles number case (just returns it).
 */
-LJLIB_CF(js_pos)		LJLIB_REC(.)
+LJLIB_ASM(js_pos)		LJLIB_REC(.)
 {
   TValue *o = lj_lib_checkany(L, 1);
 
-  /* Fast path: already a number */
-  if (tvisnumber(o)) {
-    lua_pushnumber(L, numberVnum(o));
-    return 1;
-  }
-
   /* Slow path: convert to number */
-  lua_pushnumber(L, js_toNumber_impl(L, o));
-  return 1;
+  setnumV(L->base-1-LJ_FR2, js_toNumber_impl(L, o));
+  return FFH_RES(1);
 }
 
 /* Helper: Convert string to number with JS semantics (empty string -> 0) */
@@ -598,17 +560,21 @@ LJLIB_CF(js_eq)		LJLIB_REC(.)
     goto done;
   }
 
-  /* Check for null/undefined (nil) */
+  /* Check for null/undefined */
   int a_is_null = 0, a_is_undef = 0, b_is_null = 0, b_is_undef = 0;
   if (tvisnil(a)) {
     a_is_undef = 1;
-  } else if (tvistab(a) && is_null(L, tabV(a))) {
-    a_is_null = 1;
+  } else if (tvistab(a)) {
+    GCtab *t = tabV(a);
+    if (is_null(L, t)) a_is_null = 1;
+    else if (is_undefined(L, t)) a_is_undef = 1;
   }
   if (tvisnil(b)) {
     b_is_undef = 1;
-  } else if (tvistab(b) && is_null(L, tabV(b))) {
-    b_is_null = 1;
+  } else if (tvistab(b)) {
+    GCtab *t = tabV(b);
+    if (is_null(L, t)) b_is_null = 1;
+    else if (is_undefined(L, t)) b_is_undef = 1;
   }
 
   /* null == undefined (loose equality) */
@@ -719,17 +685,21 @@ LJLIB_CF(js_neq)		LJLIB_REC(.)
     goto done;
   }
 
-  /* Check for null/undefined (nil) */
+  /* Check for null/undefined */
   int a_is_null = 0, a_is_undef = 0, b_is_null = 0, b_is_undef = 0;
   if (tvisnil(a)) {
     a_is_undef = 1;
-  } else if (tvistab(a) && is_null(L, tabV(a))) {
-    a_is_null = 1;
+  } else if (tvistab(a)) {
+    GCtab *t = tabV(a);
+    if (is_null(L, t)) a_is_null = 1;
+    else if (is_undefined(L, t)) a_is_undef = 1;
   }
   if (tvisnil(b)) {
     b_is_undef = 1;
-  } else if (tvistab(b) && is_null(L, tabV(b))) {
-    b_is_null = 1;
+  } else if (tvistab(b)) {
+    GCtab *t = tabV(b);
+    if (is_null(L, t)) b_is_null = 1;
+    else if (is_undefined(L, t)) b_is_undef = 1;
   }
 
   if ((a_is_null || a_is_undef) && (b_is_null || b_is_undef)) {
@@ -827,6 +797,15 @@ LJLIB_CF(js_seq)		LJLIB_REC(.)
   TValue *b = lj_lib_checkany(L, 2);
   int result = 0;
 
+  /* Check if both are undefined (nil or undefined sentinel) */
+  /* This handles the case where missing args (nil) are compared to undefined sentinel */
+  int a_is_undef = tvisnil(a) || (tvistab(a) && is_undefined(L, tabV(a)));
+  int b_is_undef = tvisnil(b) || (tvistab(b) && is_undefined(L, tabV(b)));
+  if (a_is_undef && b_is_undef) {
+    result = 1;
+    goto done;
+  }
+
   /* Check if types match first */
   if (itype(a) != itype(b)) {
     /* Different types - but handle int/num case */
@@ -883,6 +862,15 @@ LJLIB_CF(js_nseq)		LJLIB_REC(.)
   TValue *a = lj_lib_checkany(L, 1);
   TValue *b = lj_lib_checkany(L, 2);
   int result = 1;
+
+  /* Check if both are undefined (nil or undefined sentinel) */
+  /* This handles the case where missing args (nil) are compared to undefined sentinel */
+  int a_is_undef = tvisnil(a) || (tvistab(a) && is_undefined(L, tabV(a)));
+  int b_is_undef = tvisnil(b) || (tvistab(b) && is_undefined(L, tabV(b)));
+  if (a_is_undef && b_is_undef) {
+    result = 0;  /* undefined !== undefined is false */
+    goto done;
+  }
 
   /* Check if types match first */
   if (itype(a) != itype(b)) {
@@ -958,9 +946,51 @@ LJLIB_CF(js_ushr)		LJLIB_REC(.)
 }
 
 /*
+** typeof - JavaScript typeof operator
+**
+** Returns a string representing the type of the value:
+** - "undefined" for undefined sentinel or nil
+** - "object" for null (JS quirk) and tables
+** - "boolean" for true/false
+** - "number" for numbers
+** - "string" for strings
+** - "function" for functions
+*/
+LJLIB_CF(js_typeof)	LJLIB_REC(.)
+{
+  TValue *o = lj_lib_checkany(L, 1);
+
+  if (tvisnil(o)) {
+    lua_pushliteral(L, "undefined");
+  } else if (tvistrue(o) || tvisfalse(o)) {
+    lua_pushliteral(L, "boolean");
+  } else if (tvisnumber(o)) {
+    lua_pushliteral(L, "number");
+  } else if (tvisstr(o)) {
+    lua_pushliteral(L, "string");
+  } else if (tvisfunc(o)) {
+    lua_pushliteral(L, "function");
+  } else if (tvistab(o)) {
+    GCtab *t = tabV(o);
+    /* Check for undefined sentinel */
+    if (is_undefined(L, t)) {
+      lua_pushliteral(L, "undefined");
+    } else {
+      /* Note: typeof null === "object" in JavaScript */
+      lua_pushliteral(L, "object");
+    }
+  } else {
+    /* Catch-all for other types (shouldn't normally happen in JS) */
+    lua_pushliteral(L, "object");
+  }
+
+  return 1;
+}
+
+/*
 ** isNullish - Check if value is null or undefined
 **
-** Returns true if val is null, undefined, or nil.
+** Returns true if val is null, undefined sentinel, or nil.
 */
 LJLIB_CF(js_isNullish)		LJLIB_REC(.)
 {
@@ -972,7 +1002,7 @@ LJLIB_CF(js_isNullish)		LJLIB_REC(.)
   }
   else if (tvistab(o)) {
     GCtab *t = tabV(o);
-    if (is_null(L, t)) {
+    if (is_null(L, t) || is_undefined(L, t)) {
       result = 1;
     }
   }
@@ -1018,8 +1048,11 @@ static int is_array_index(TValue *tv, lua_Number *out_idx)
 ** For valid array indices (non-negative integers or numeric strings),
 ** uses 1-indexed internal storage for LuaJIT optimization.
 ** For other keys, uses direct access.
+**
+** Assembly fast path handles: table + non-negative integer index in array bounds.
+** Fallback handles: string keys, string indices, hash part lookups.
 */
-LJLIB_CF(js_getElem)		LJLIB_REC(.)
+LJLIB_ASM(js_getElem)		LJLIB_REC(.)
 {
   GCtab *t = lj_lib_checktab(L, 1);
   TValue *idx = lj_lib_checkany(L, 2);
@@ -1031,20 +1064,20 @@ LJLIB_CF(js_getElem)		LJLIB_REC(.)
     setnumV(&key, array_idx + 1);
     cTValue *v = lj_tab_get(L, t, &key);
     if (v) {
-      copyTV(L, L->top++, v);
+      copyTV(L, L->base-1-LJ_FR2, v);
     } else {
-      setnilV(L->top++);
+      setnilV(L->base-1-LJ_FR2);
     }
   } else {
     /* Hash access: use key directly */
     cTValue *v = lj_tab_get(L, t, idx);
     if (v) {
-      copyTV(L, L->top++, v);
+      copyTV(L, L->base-1-LJ_FR2, v);
     } else {
-      setnilV(L->top++);
+      setnilV(L->base-1-LJ_FR2);
     }
   }
-  return 1;
+  return FFH_RES(1);
 }
 
 /*
@@ -1053,8 +1086,12 @@ LJLIB_CF(js_getElem)		LJLIB_REC(.)
 ** For valid array indices, uses 1-indexed internal storage and
 ** updates 'length' property if needed.
 ** For other keys, uses direct access without affecting length.
+**
+** Assembly fast path handles: table + non-negative integer index in array bounds.
+** Fast path skips length update (assumes index < current length).
+** Fallback handles: string keys, string indices, hash part, length updates.
 */
-LJLIB_CF(js_setElem)		LJLIB_REC(.)
+LJLIB_ASM(js_setElem)		LJLIB_REC(.)
 {
   GCtab *t = lj_lib_checktab(L, 1);
   TValue *idx = lj_lib_checkany(L, 2);
@@ -1087,23 +1124,26 @@ LJLIB_CF(js_setElem)		LJLIB_REC(.)
     copyTV(L, slot, val);
     lj_gc_anybarriert(L, t);
   }
-  return 0;
+  return FFH_RES(0);
 }
 
 /*
-** init - Initialize the js library with the null sentinel.
+** init - Initialize the js library with null and undefined sentinels.
 **
-** Usage: js.init(null)
+** Usage: js.init(null, undefined)
 **
-** This stores the null sentinel in the registry so fast functions can access it.
-** Note: undefined is just Lua nil, no need to store it.
+** This stores the sentinels in the registry so fast functions can access them.
 */
 LJLIB_CF(js_init)
 {
   lj_lib_checktab(L, 1);  /* null */
+  lj_lib_checktab(L, 2);  /* undefined */
 
   lua_pushvalue(L, 1);
   lua_setfield(L, LUA_REGISTRYINDEX, JS_NULL_KEY);
+
+  lua_pushvalue(L, 2);
+  lua_setfield(L, LUA_REGISTRYINDEX, JS_UNDEFINED_KEY);
 
   return 0;
 }

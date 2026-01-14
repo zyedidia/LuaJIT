@@ -1163,6 +1163,11 @@ static void build_subroutines(BuildCtx *ctx)
   |  endbr; cmp NARGS:RDd, 2+1;  jb ->fff_fallback
   |.endmacro
   |
+  |.macro .ffunc_3, name
+  |->ff_ .. name:
+  |  endbr; cmp NARGS:RDd, 3+1;  jb ->fff_fallback
+  |.endmacro
+  |
   |.macro .ffunc_n, name, op
   |  .ffunc_1 name
   |  checknumtp [BASE], ->fff_fallback
@@ -2141,8 +2146,228 @@ static void build_subroutines(BuildCtx *ctx)
   |.ffunc_bit_sh bit_rol, rol
   |.ffunc_bit_sh bit_ror, ror
   |
+  |//-- JavaScript library -------------------------------------------------
+  |
+  |// js.add/sub/mul/div with folded load (saves one movsd vs .ffunc_nn)
+  |.ffunc_2 js_add
+  |  checknumtp [BASE], ->fff_fallback
+  |  checknumtp [BASE+8], ->fff_fallback
+  |  movsd xmm0, qword [BASE]
+  |  addsd xmm0, qword [BASE+8]
+  |  jmp ->fff_resxmm0
+  |
+  |.ffunc_2 js_sub
+  |  checknumtp [BASE], ->fff_fallback
+  |  checknumtp [BASE+8], ->fff_fallback
+  |  movsd xmm0, qword [BASE]
+  |  subsd xmm0, qword [BASE+8]
+  |  jmp ->fff_resxmm0
+  |
+  |.ffunc_2 js_mul
+  |  checknumtp [BASE], ->fff_fallback
+  |  checknumtp [BASE+8], ->fff_fallback
+  |  movsd xmm0, qword [BASE]
+  |  mulsd xmm0, qword [BASE+8]
+  |  jmp ->fff_resxmm0
+  |
+  |.ffunc_2 js_div
+  |  checknumtp [BASE], ->fff_fallback
+  |  checknumtp [BASE+8], ->fff_fallback
+  |  movsd xmm0, qword [BASE]
+  |  divsd xmm0, qword [BASE+8]
+  |  jmp ->fff_resxmm0
+  |
+  |.ffunc_nn js_mod
+  |  mov RB, BASE
+  |  call extern fmod
+  |  mov BASE, RB
+  |  jmp ->fff_resxmm0
+  |
+  |.ffunc_nn js_pow
+  |  mov RB, BASE
+  |  call extern pow
+  |  mov BASE, RB
+  |  jmp ->fff_resxmm0
+  |
+  |.ffunc_n js_neg
+  |  mov64 RB, U64x(80000000,00000000)  // Sign bit mask
+  |  movd xmm1, RB
+  |  xorpd xmm0, xmm1                   // Flip sign bit
+  |  jmp ->fff_resxmm0
+  |
+  |.ffunc_n js_pos
+  |  jmp ->fff_resxmm0                  // Already a number, just return it
+  |
+  |.ffunc_n js_inc
+  |  mov64 RB, U64x(3ff00000,00000000)  // 1.0
+  |  movd xmm1, RB
+  |  addsd xmm0, xmm1
+  |  jmp ->fff_resxmm0
+  |
+  |.ffunc_n js_dec
+  |  mov64 RB, U64x(3ff00000,00000000)  // 1.0
+  |  movd xmm1, RB
+  |  subsd xmm0, xmm1
+  |  jmp ->fff_resxmm0
+  |
+  |// Boolean constants for GC64 mode:
+  |// false = ~((uint64_t)1 << 47) = 0xFFFF7FFFFFFFFFFF
+  |// true  = ~((uint64_t)2 << 47) = 0xFFFEFFFFFFFFFFFF
+  |
+  |.ffunc_nn js_lt
+  |  ucomisd xmm0, xmm1
+  |  jp >1                              // NaN -> false
+  |  jae >1                             // a >= b -> false
+  |  mov64 RB, U64x(fffeffff,ffffffff)  // true
+  |  jmp >2
+  |1:
+  |  mov64 RB, U64x(ffff7fff,ffffffff)  // false
+  |2:
+  |  mov PC, [BASE-8]
+  |  mov [BASE-16], RB
+  |  jmp ->fff_res1
+  |
+  |.ffunc_nn js_gt
+  |  ucomisd xmm0, xmm1
+  |  jp >1                              // NaN -> false
+  |  jbe >1                             // a <= b -> false
+  |  mov64 RB, U64x(fffeffff,ffffffff)  // true
+  |  jmp >2
+  |1:
+  |  mov64 RB, U64x(ffff7fff,ffffffff)  // false
+  |2:
+  |  mov PC, [BASE-8]
+  |  mov [BASE-16], RB
+  |  jmp ->fff_res1
+  |
+  |.ffunc_nn js_lte
+  |  ucomisd xmm0, xmm1
+  |  jp >1                              // NaN -> false
+  |  ja >1                              // a > b -> false
+  |  mov64 RB, U64x(fffeffff,ffffffff)  // true
+  |  jmp >2
+  |1:
+  |  mov64 RB, U64x(ffff7fff,ffffffff)  // false
+  |2:
+  |  mov PC, [BASE-8]
+  |  mov [BASE-16], RB
+  |  jmp ->fff_res1
+  |
+  |.ffunc_nn js_gte
+  |  ucomisd xmm0, xmm1
+  |  jp >1                              // NaN -> false
+  |  jb >1                              // a < b -> false
+  |  mov64 RB, U64x(fffeffff,ffffffff)  // true
+  |  jmp >2
+  |1:
+  |  mov64 RB, U64x(ffff7fff,ffffffff)  // false
+  |2:
+  |  mov PC, [BASE-8]
+  |  mov [BASE-16], RB
+  |  jmp ->fff_res1
+  |
+  |// js_toBoolean(value) - convert to boolean
+  |// Fast path: nil, false, true, numbers (0/NaN check)
+  |// Fallback handles: strings (empty check), tables (null check)
+  |.ffunc_1 js_toBoolean
+  |  mov RB, [BASE]                     // Load arg1 (64-bit tagged value)
+  |  mov ITYPE, RB
+  |  sar ITYPE, 47                      // Get itype
+  |  cmp ITYPEd, LJ_TFALSE              // nil or false?
+  |  jae >1                             // -> return false
+  |  cmp ITYPEd, LJ_TTRUE               // true?
+  |  je >2                              // -> return true
+  |  cmp ITYPEd, LJ_TISNUM              // number?
+  |  ja ->fff_fallback                  // string/table/etc -> fallback
+  |  // Number: check for 0 or NaN
+  |  movsd xmm0, qword [BASE]           // Load double from memory
+  |  xorpd xmm1, xmm1                   // xmm1 = 0.0
+  |  ucomisd xmm0, xmm1                 // compare with 0
+  |  jp >1                              // NaN -> false
+  |  je >1                              // 0 -> false
+  |  // Non-zero, non-NaN number -> true
+  |2:
+  |  mov64 RB, U64x(fffeffff,ffffffff)  // true
+  |  jmp >3
+  |1:
+  |  mov64 RB, U64x(ffff7fff,ffffffff)  // false
+  |3:
+  |  mov PC, [BASE-8]
+  |  mov [BASE-16], RB
+  |  jmp ->fff_res1
+  |
+  |// js_getElem(table, index) - get array/object element
+  |// Fast path: table + non-negative integer index in array bounds
+  |// NOTE: RC = RD = NARGS, so after loading index, use fff_fallback_2 to restore NARGS
+  |.ffunc_2 js_getElem
+  |  mov TAB:RA, [BASE]                 // Load arg1 (table)
+  |  mov RC, [BASE+8]                   // Load arg2 (index) - CORRUPTS NARGS!
+  |  checktab TAB:RA, ->fff_fallback_2  // Check arg1 is a table
+  |  // Check arg2 is a number and convert to int
+  |  checknum RC, ->fff_fallback_2
+  |  movd xmm0, RC
+  |  cvttsd2si RCd, xmm0                // Convert to int
+  |  cvtsi2sd xmm1, RCd
+  |  ucomisd xmm0, xmm1
+  |  jne ->fff_fallback_2               // Not an exact integer
+  |  test RCd, RCd
+  |  js ->fff_fallback_2                // Negative index
+  |  // Add 1 for JS 0-index to Lua 1-index
+  |  add RCd, 1
+  |  // Check bounds
+  |  cmp RCd, TAB:RA->asize
+  |  jae ->fff_fallback_2               // Out of array bounds
+  |  // Get array slot
+  |  shl RCd, 3
+  |  add RC, TAB:RA->array
+  |  mov RB, [RC]                       // Load value
+  |  mov PC, [BASE-8]
+  |  mov [BASE-16], RB
+  |  jmp ->fff_res1
+  |
+  |// js_setElem(table, index, value) - set array/object element
+  |// Fast path: table + non-negative integer index in array bounds
+  |// Skips length update - fallback handles that case
+  |// NOTE: RC = RD = NARGS, so after loading index, use fff_fallback_3 to restore NARGS
+  |.ffunc_3 js_setElem
+  |  mov TAB:TMPR, [BASE]               // Load arg1 (table)
+  |  mov RC, [BASE+8]                   // Load arg2 (index) - CORRUPTS NARGS!
+  |  checktab TAB:TMPR, ->fff_fallback_3  // Check arg1 is a table
+  |  // Check arg2 is a number and convert to int
+  |  checknum RC, ->fff_fallback_3
+  |  movd xmm0, RC
+  |  cvttsd2si RCd, xmm0                // Convert to int
+  |  cvtsi2sd xmm1, RCd
+  |  ucomisd xmm0, xmm1
+  |  jne ->fff_fallback_3               // Not an exact integer
+  |  test RCd, RCd
+  |  js ->fff_fallback_3                // Negative index
+  |  // Add 1 for JS 0-index to Lua 1-index
+  |  add RCd, 1
+  |  // Check bounds
+  |  cmp RCd, TAB:TMPR->asize
+  |  jae ->fff_fallback_3               // Out of array bounds
+  |  // Get array slot address
+  |  shl RCd, 3
+  |  add RC, TAB:TMPR->array
+  |  // Store value
+  |  mov RA, [BASE+16]                  // Load arg3 (value)
+  |  mov [RC], RA
+  |  // GC barrier check
+  |  test byte TAB:TMPR->marked, LJ_GC_BLACK
+  |  jnz >7
+  |1:
+  |  mov PC, [BASE-8]
+  |  jmp ->fff_res0
+  |7:  // GC barrier - mark table gray and add to grayagain list
+  |  barrierback TAB:TMPR, RA
+  |  jmp <1
+  |
   |//-----------------------------------------------------------------------
   |
+  |->fff_fallback_3:
+  |  mov NARGS:RDd, 1+3			// 3 args for setElem
+  |  jmp ->fff_fallback
   |->fff_fallback_2:
   |  mov NARGS:RDd, 1+2			// Other args are ignored, anyway.
   |  jmp ->fff_fallback

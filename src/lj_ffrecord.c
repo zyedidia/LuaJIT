@@ -174,6 +174,31 @@ static void LJ_FASTCALL recff_nyi(jit_State *J, RecordFFData *rd)
 	case FF_error:
 	case FF_debug_sethook:
 	case FF_jit_flush:
+	/* Don't stitch across JS fast functions - they have custom return handling. */
+	case FF_js_toBoolean:
+	case FF_js_inc:
+	case FF_js_dec:
+	case FF_js_lt:
+	case FF_js_gt:
+	case FF_js_lte:
+	case FF_js_gte:
+	case FF_js_toNumber:
+	case FF_js_add:
+	case FF_js_sub:
+	case FF_js_mul:
+	case FF_js_div:
+	case FF_js_mod:
+	case FF_js_pow:
+	case FF_js_neg:
+	case FF_js_pos:
+	case FF_js_eq:
+	case FF_js_neq:
+	case FF_js_seq:
+	case FF_js_nseq:
+	case FF_js_ushr:
+	case FF_js_isNullish:
+	case FF_js_getElem:
+	case FF_js_setElem:
 	  break;  /* Don't stitch across special builtins. */
 	default:
 	  recff_stitch(J);  /* Use trace stitching. */
@@ -1581,32 +1606,27 @@ static void LJ_FASTCALL recff_js_toBoolean(jit_State *J, RecordFFData *rd)
 
   if (!tr) return;  /* Interpreter will throw for missing arg */
 
-  /* Check type and return constant boolean based on JS truthiness rules */
+  /* For types where the result is always constant, return constant. */
+  /* For numbers (which may vary at runtime), fall back to interpreter. */
   if (tvisnil(tv)) {
-    J->base[0] = TREF_FALSE;  /* nil (undefined) is falsy */
+    J->base[0] = TREF_FALSE;  /* nil (undefined) is always falsy */
   } else if (tvisfalse(tv)) {
-    J->base[0] = TREF_FALSE;
+    J->base[0] = TREF_FALSE;  /* false is always falsy */
   } else if (tvistrue(tv)) {
-    J->base[0] = TREF_TRUE;
+    J->base[0] = TREF_TRUE;  /* true is always truthy */
   } else if (tvisnumber(tv)) {
-    lua_Number n = numberVnum(tv);
-    /* 0 and NaN are falsy */
-    J->base[0] = (n == 0 || n != n) ? TREF_FALSE : TREF_TRUE;
+    /* Numbers require runtime check (could be 0, NaN, or other).
+     * Fall back to interpreter via recff_nyi. */
+    recff_nyi(J, rd);
+    return;
   } else if (tvisstr(tv)) {
-    GCstr *s = strV(tv);
-    /* Empty string is falsy */
-    J->base[0] = (s->len == 0) ? TREF_FALSE : TREF_TRUE;
+    /* Strings require runtime check for length. Fall back. */
+    recff_nyi(J, rd);
+    return;
   } else if (tvistab(tv)) {
-    GCtab *t = tabV(tv);
-    /* Check against null sentinel from registry */
-    lua_State *L = J->L;
-    GCtab *reg = tabV(registry(L));
-    cTValue *null_tv = lj_tab_getstr(reg, lj_str_newlit(L, JS_NULL_KEY));
-    if (null_tv && tvistab(null_tv) && tabV(null_tv) == t) {
-      J->base[0] = TREF_FALSE;  /* null is falsy */
-    } else {
-      J->base[0] = TREF_TRUE;  /* other tables are truthy */
-    }
+    /* Tables require runtime check for null sentinel. Fall back. */
+    recff_nyi(J, rd);
+    return;
   } else {
     /* Everything else is truthy */
     J->base[0] = TREF_TRUE;
@@ -2072,6 +2092,52 @@ static void LJ_FASTCALL recff_js_isNullish(jit_State *J, RecordFFData *rd)
     }
   } else {
     J->base[0] = TREF_FALSE;
+  }
+}
+
+static void LJ_FASTCALL recff_js_typeof(jit_State *J, RecordFFData *rd)
+{
+  TRef tr = J->base[0];
+  TValue *tv = &rd->argv[0];
+
+  if (!tr) return;
+
+  /* typeof always returns a constant string based on the runtime type */
+  if (tvisnil(tv)) {
+    J->base[0] = lj_ir_kstr(J, lj_str_newlit(J->L, "undefined"));
+  } else if (tvistrue(tv) || tvisfalse(tv)) {
+    J->base[0] = lj_ir_kstr(J, lj_str_newlit(J->L, "boolean"));
+  } else if (tvisnumber(tv)) {
+    J->base[0] = lj_ir_kstr(J, lj_str_newlit(J->L, "number"));
+  } else if (tvisstr(tv)) {
+    J->base[0] = lj_ir_kstr(J, lj_str_newlit(J->L, "string"));
+  } else if (tvisfunc(tv)) {
+    J->base[0] = lj_ir_kstr(J, lj_str_newlit(J->L, "function"));
+  } else if (tvistab(tv)) {
+    GCtab *t = tabV(tv);
+
+    /* Look up undefined sentinel from registry */
+    lua_getfield(J->L, LUA_REGISTRYINDEX, "__js_undefined");
+    GCtab *undef_sentinel = lua_istable(J->L, -1) ? tabV(J->L->top - 1) : NULL;
+    lua_pop(J->L, 1);
+
+    if (undef_sentinel && t == undef_sentinel) {
+      /* Recording with undefined sentinel - emit guard and return "undefined" */
+      TRef tref_undef = lj_ir_ktab(J, undef_sentinel);
+      emitir(IRTG(IR_EQ, IRT_TAB), tr, tref_undef);
+      J->base[0] = lj_ir_kstr(J, lj_str_newlit(J->L, "undefined"));
+    } else {
+      /* Recording with non-undefined table - emit guard and return "object" */
+      if (undef_sentinel) {
+        TRef tref_undef = lj_ir_ktab(J, undef_sentinel);
+        emitir(IRTG(IR_NE, IRT_TAB), tr, tref_undef);
+      }
+      /* Note: typeof null === "object" in JavaScript, so this is correct */
+      J->base[0] = lj_ir_kstr(J, lj_str_newlit(J->L, "object"));
+    }
+  } else {
+    /* Catch-all for other types */
+    J->base[0] = lj_ir_kstr(J, lj_str_newlit(J->L, "object"));
   }
 }
 
